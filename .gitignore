@@ -1,0 +1,17 @@
+  # Build artifacts
+  *.o
+  *.so
+  *.dylib
+  *.dll
+  *.bc
+
+  # Test results
+  regression.diffs
+  regression.out
+  results/
+  tmp_check/
+
+  # Editor files
+  *~
+  .*.swp
+  .DS_Store
