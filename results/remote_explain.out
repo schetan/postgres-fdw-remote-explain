@@ -1,0 +1,260 @@
+-- ===================================================================
+-- Test remote EXPLAIN functionality
+-- ===================================================================
+--
+-- Tests the postgres_fdw.show_remote_plans GUC which displays execution
+-- plans from foreign servers inline with local EXPLAIN output.
+--
+-- Test coverage:
+-- - Backward compatibility (feature disabled by default)
+-- - Remote plan display when enabled
+-- - Toggle behavior (on/off)
+-- - Multiple foreign scans (UNION ALL)
+-- - InitPlans with subqueries
+-- - Foreign joins (skipped in Phase 1)
+--
+-- TODU: Add EXPLAIN ANALYZE tests in Phase 2
+--
+-- Setup: Relies on objects from postgres_fdw.sql (loopback server, ft1, ft2)
+-- Test order: postgres_fdw.sql -> query_cancel.sql -> remote_explain.sql
+-- ===================================================================
+-- Test 1: Backward compatibility - feature disabled (default)
+-- ===================================================================
+-- EXPLAIN VERBOSE output should NOT show remote plan
+EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM ft1 WHERE c1 = 1;
+                                         QUERY PLAN                                          
+---------------------------------------------------------------------------------------------
+ Foreign Scan on public.ft1
+   Output: c1, c2, c3, c4, c5, c6, c7, c8
+   Remote SQL: SELECT "C 1", c2, c3, c4, c5, c6, c7, c8 FROM "S 1"."T 1" WHERE (("C 1" = 1))
+(3 rows)
+
+-- ===================================================================
+-- Test 2: Enable feature and verify remote plan display
+-- ===================================================================
+SET postgres_fdw.show_remote_plans = on;
+-- Verify setting
+SHOW postgres_fdw.show_remote_plans;
+ postgres_fdw.show_remote_plans 
+--------------------------------
+ on
+(1 row)
+
+-- Simple query - should show remote plan
+EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM ft1 WHERE c1 = 1;
+                                         QUERY PLAN                                          
+---------------------------------------------------------------------------------------------
+ Foreign Scan on public.ft1
+   Output: c1, c2, c3, c4, c5, c6, c7, c8
+   Remote SQL: SELECT "C 1", c2, c3, c4, c5, c6, c7, c8 FROM "S 1"."T 1" WHERE (("C 1" = 1))
+   Remote Plan:
+     Index Scan using t1_pkey on "S 1"."T 1"  (cost=0.28..8.29 rows=1 width=54)
+       Output: "C 1", c2, c3, c4, c5, c6, c7, c8
+       Index Cond: ("T 1"."C 1" = 1)
+(7 rows)
+
+-- Query with multiple conditions
+EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM ft1 WHERE c1 > 100 AND c2 < 5;
+                                                  QUERY PLAN                                                  
+--------------------------------------------------------------------------------------------------------------
+ Foreign Scan on public.ft1
+   Output: c1, c2, c3, c4, c5, c6, c7, c8
+   Remote SQL: SELECT "C 1", c2, c3, c4, c5, c6, c7, c8 FROM "S 1"."T 1" WHERE (("C 1" > 100)) AND ((c2 < 5))
+   Remote Plan:
+     Seq Scan on "S 1"."T 1"  (cost=0.00..25.31 rows=90 width=54)
+       Output: "C 1", c2, c3, c4, c5, c6, c7, c8
+       Filter: (("T 1"."C 1" > 100) AND ("T 1".c2 < 5))
+(7 rows)
+
+-- Query with ORDER BY
+EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM ft1 WHERE c1 > 100 ORDER BY c3 LIMIT 10;
+                                                                QUERY PLAN                                                                 
+-------------------------------------------------------------------------------------------------------------------------------------------
+ Foreign Scan on public.ft1
+   Output: c1, c2, c3, c4, c5, c6, c7, c8
+   Remote SQL: SELECT "C 1", c2, c3, c4, c5, c6, c7, c8 FROM "S 1"."T 1" WHERE (("C 1" > 100)) ORDER BY c3 ASC NULLS LAST LIMIT 10::bigint
+   Remote Plan:
+     Limit  (cost=39.30..39.32 rows=10 width=54)
+       Output: "C 1", c2, c3, c4, c5, c6, c7, c8
+       ->  Sort  (cost=39.30..41.15 rows=742 width=54)
+             Output: "C 1", c2, c3, c4, c5, c6, c7, c8
+             Sort Key: "T 1".c3
+             ->  Seq Scan on "S 1"."T 1"  (cost=0.00..23.26 rows=742 width=54)
+                   Output: "C 1", c2, c3, c4, c5, c6, c7, c8
+                   Filter: ("T 1"."C 1" > 100)
+(12 rows)
+
+-- Join query - pushed down join has scanrelid=0, skipped for now
+-- TODU: Phase 2 should support same-server joins by iterating fs_base_relids
+EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM ft1 t1, ft2 t2 WHERE t1.c1 = t2.c1 AND t1.c1 = 1;
+                                                                                                              QUERY PLAN                                                                                                              
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Foreign Scan
+   Output: t1.c1, t1.c2, t1.c3, t1.c4, t1.c5, t1.c6, t1.c7, t1.c8, t2.c1, t2.c2, t2.c3, t2.c4, t2.c5, t2.c6, t2.c7, t2.c8
+   Relations: (public.ft1 t1) INNER JOIN (public.ft2 t2)
+   Remote SQL: SELECT r1."C 1", r1.c2, r1.c3, r1.c4, r1.c5, r1.c6, r1.c7, r1.c8, r2."C 1", r2.c2, r2.c3, r2.c4, r2.c5, r2.c6, r2.c7, r2.c8 FROM ("S 1"."T 1" r1 INNER JOIN "S 1"."T 1" r2 ON (((r2."C 1" = 1)) AND ((r1."C 1" = 1))))
+(4 rows)
+
+-- ===================================================================
+-- Test 3: Disable feature again
+-- ===================================================================
+SET postgres_fdw.show_remote_plans = off;
+-- Verify setting
+SHOW postgres_fdw.show_remote_plans;
+ postgres_fdw.show_remote_plans 
+--------------------------------
+ off
+(1 row)
+
+-- Should NOT show remote plan again
+EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM ft1 WHERE c1 = 1;
+                                         QUERY PLAN                                          
+---------------------------------------------------------------------------------------------
+ Foreign Scan on public.ft1
+   Output: c1, c2, c3, c4, c5, c6, c7, c8
+   Remote SQL: SELECT "C 1", c2, c3, c4, c5, c6, c7, c8 FROM "S 1"."T 1" WHERE (("C 1" = 1))
+(3 rows)
+
+-- ===================================================================
+-- Test 4: Feature works with other EXPLAIN options
+-- ===================================================================
+SET postgres_fdw.show_remote_plans = on;
+-- With BUFFERS
+EXPLAIN (VERBOSE, COSTS OFF, BUFFERS) SELECT * FROM ft1 WHERE c1 = 1;
+                                         QUERY PLAN                                          
+---------------------------------------------------------------------------------------------
+ Foreign Scan on public.ft1
+   Output: c1, c2, c3, c4, c5, c6, c7, c8
+   Remote SQL: SELECT "C 1", c2, c3, c4, c5, c6, c7, c8 FROM "S 1"."T 1" WHERE (("C 1" = 1))
+   Remote Plan:
+     Index Scan using t1_pkey on "S 1"."T 1"  (cost=0.28..8.29 rows=1 width=54)
+       Output: "C 1", c2, c3, c4, c5, c6, c7, c8
+       Index Cond: ("T 1"."C 1" = 1)
+(7 rows)
+
+-- ===================================================================
+-- Test 5: Multiple foreign tables
+-- ===================================================================
+SET postgres_fdw.show_remote_plans = on;
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT * FROM ft1 WHERE c1 = 1
+UNION ALL
+SELECT * FROM ft1 WHERE c1 = 2;
+                                            QUERY PLAN                                             
+---------------------------------------------------------------------------------------------------
+ Append
+   ->  Foreign Scan on public.ft1
+         Output: ft1.c1, ft1.c2, ft1.c3, ft1.c4, ft1.c5, ft1.c6, ft1.c7, ft1.c8
+         Remote SQL: SELECT "C 1", c2, c3, c4, c5, c6, c7, c8 FROM "S 1"."T 1" WHERE (("C 1" = 1))
+         Remote Plan:
+           Index Scan using t1_pkey on "S 1"."T 1"  (cost=0.28..8.29 rows=1 width=54)
+             Output: "C 1", c2, c3, c4, c5, c6, c7, c8
+             Index Cond: ("T 1"."C 1" = 1)
+   ->  Foreign Scan on public.ft1 ft1_1
+         Output: ft1_1.c1, ft1_1.c2, ft1_1.c3, ft1_1.c4, ft1_1.c5, ft1_1.c6, ft1_1.c7, ft1_1.c8
+         Remote SQL: SELECT "C 1", c2, c3, c4, c5, c6, c7, c8 FROM "S 1"."T 1" WHERE (("C 1" = 2))
+         Remote Plan:
+           Index Scan using t1_pkey on "S 1"."T 1"  (cost=0.28..8.29 rows=1 width=54)
+             Output: "C 1", c2, c3, c4, c5, c6, c7, c8
+             Index Cond: ("T 1"."C 1" = 2)
+(15 rows)
+
+-- ===================================================================
+-- Test 6: InitPlan - Scalar subquery in WHERE clause
+-- ===================================================================
+SET postgres_fdw.show_remote_plans = on;
+-- Scalar subquery - should show InitPlan in remote plan
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT * FROM ft1 WHERE c1 = (SELECT MAX(c1) FROM ft1);
+                                              QUERY PLAN                                               
+-------------------------------------------------------------------------------------------------------
+ Foreign Scan on public.ft1
+   Output: ft1.c1, ft1.c2, ft1.c3, ft1.c4, ft1.c5, ft1.c6, ft1.c7, ft1.c8
+   Remote SQL: SELECT "C 1", c2, c3, c4, c5, c6, c7, c8 FROM "S 1"."T 1" WHERE (("C 1" = $1::integer))
+   InitPlan expr_1
+     ->  Result
+           Output: (InitPlan minmax_1).col1
+           Replaces: MinMaxAggregate
+           InitPlan minmax_1
+             ->  Limit
+                   Output: ft1_1.c1
+                   ->  Foreign Scan on public.ft1 ft1_1
+                         Output: ft1_1.c1
+                         Remote SQL: SELECT "C 1" FROM "S 1"."T 1" ORDER BY "C 1" DESC NULLS FIRST
+(13 rows)
+
+-- ===================================================================
+-- Test 7: InitPlan - Multiple scalar subqueries
+-- ===================================================================
+-- Multiple subqueries - should show multiple InitPlans
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT * FROM ft1
+WHERE c1 > (SELECT MIN(c1) FROM ft1)
+  AND c1 < (SELECT MAX(c1) FROM ft1);
+                                                            QUERY PLAN                                                             
+-----------------------------------------------------------------------------------------------------------------------------------
+ Foreign Scan on public.ft1
+   Output: ft1.c1, ft1.c2, ft1.c3, ft1.c4, ft1.c5, ft1.c6, ft1.c7, ft1.c8
+   Remote SQL: SELECT "C 1", c2, c3, c4, c5, c6, c7, c8 FROM "S 1"."T 1" WHERE (("C 1" > $1::integer)) AND (("C 1" < $2::integer))
+   InitPlan expr_1
+     ->  Result
+           Output: (InitPlan minmax_1).col1
+           Replaces: MinMaxAggregate
+           InitPlan minmax_1
+             ->  Limit
+                   Output: ft1_1.c1
+                   ->  Foreign Scan on public.ft1 ft1_1
+                         Output: ft1_1.c1
+                         Remote SQL: SELECT "C 1" FROM "S 1"."T 1" ORDER BY "C 1" ASC NULLS LAST
+   InitPlan expr_2
+     ->  Result
+           Output: (InitPlan minmax_2).col1
+           Replaces: MinMaxAggregate
+           InitPlan minmax_2
+             ->  Limit
+                   Output: ft1_2.c1
+                   ->  Foreign Scan on public.ft1 ft1_2
+                         Output: ft1_2.c1
+                         Remote SQL: SELECT "C 1" FROM "S 1"."T 1" ORDER BY "C 1" DESC NULLS FIRST
+(23 rows)
+
+-- ===================================================================
+-- Test 8: InitPlan - NOT IN subquery
+-- ===================================================================
+-- NOT IN with subquery - should show InitPlan
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT * FROM ft1
+WHERE c1 NOT IN (SELECT c1 FROM ft1 WHERE c2 > 500);
+                                   QUERY PLAN                                   
+--------------------------------------------------------------------------------
+ Nested Loop Anti Join
+   Output: ft1.c1, ft1.c2, ft1.c3, ft1.c4, ft1.c5, ft1.c6, ft1.c7, ft1.c8
+   Join Filter: (ft1.c1 = ft1_1.c1)
+   ->  Foreign Scan on public.ft1
+         Output: ft1.c1, ft1.c2, ft1.c3, ft1.c4, ft1.c5, ft1.c6, ft1.c7, ft1.c8
+         Remote SQL: SELECT "C 1", c2, c3, c4, c5, c6, c7, c8 FROM "S 1"."T 1"
+         Remote Plan:
+           Seq Scan on "S 1"."T 1"  (cost=0.00..21.21 rows=821 width=54)
+             Output: "C 1", c2, c3, c4, c5, c6, c7, c8
+   ->  Materialize
+         Output: ft1_1.c1
+         ->  Foreign Scan on public.ft1 ft1_1
+               Output: ft1_1.c1
+               Remote SQL: SELECT "C 1" FROM "S 1"."T 1" WHERE ((c2 > 500))
+               Remote Plan:
+                 Seq Scan on "S 1"."T 1"  (cost=0.00..23.26 rows=208 width=4)
+                   Output: "C 1"
+                   Filter: ("T 1".c2 > 500)
+(18 rows)
+
+-- ===================================================================
+-- Cleanup: Reset to default
+-- ===================================================================
+RESET postgres_fdw.show_remote_plans;
+-- Final verification
+SHOW postgres_fdw.show_remote_plans;
+ postgres_fdw.show_remote_plans 
+--------------------------------
+ off
+(1 row)
+
